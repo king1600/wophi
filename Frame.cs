@@ -154,10 +154,10 @@ namespace Wophi {
         }
 
         // get payload data
-        for (Uint64 i = 0; i < size; i++)
-          frame.Data[i] = (byte)(!frame.Masked ?  // check if frame is masked
-            data[(int)(offset) + i] ^ mask[i % 4] // if masked, unmask using masking key
-            : data[(int)(offset) + i]);           // if not, use raw byte value
+        for (UInt64 i = 0; i < (UInt64)size; i++)
+          frame.Data[i] = (byte)(frame.Masked ?  // check if frame is masked
+            data[offset + i] ^ mask[i % 4]        // if masked, unmask using masking key
+            : data[offset + i]);                  // if not, use raw byte value
         frame.Complete = true;                    // everything ok, frame complete!
 
       // incomplete on error
