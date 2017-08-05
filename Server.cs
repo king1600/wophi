@@ -63,6 +63,43 @@ namespace Wophi {
         await stream.WriteAsync(output, 0, output.Length);
     }
 
+    // perform synchronous send
+    public void Send(byte[] message, OpCode opcode = OpCode.Text)
+    {
+      SendFrame(opcode, message).GetAwaiter().GetResult();
+    }
+
+    // perform asynchronous send
+    public async Task SendAsync(byte[] message, OpCode opcode = OpCode.Text)
+    {
+      await SendFrame(opcode, message);
+    }
+
+    // perform synchronous close
+    public void Close(ushort code, byte[] reason)
+    {
+      CloseAsync(code, reason).GetAwaiter().GetResult();
+    }
+
+    // perform asynchronous close
+    public async Task CloseAsync(ushort code, byte[] reason)
+    {
+      // TODO: implement close code checking for ranges
+
+      byte[] closeCode = BitConverter.GetBytes(code);
+      Array.Reverse(closeCode); // little to big endian
+
+      byte[] closeFrame = new byte[closeCode.Length + reason.Length];
+      closeCode.CopyTo(closeFrame, 0);
+      reason.CopyTo(closeFrame, closeCode.Length);
+
+      await SendFrame(OpCode.Close, closeFrame);
+
+      client.Dispose(); // close the socket
+      if (server.GetClients().Contains(this))
+        server.GetClients().Remove(this);
+    }
+
     // perform synchronous ping
     public void Ping(byte[] message = null) {
       PingAsync(message).GetAwaiter().GetResult();
@@ -98,6 +135,11 @@ namespace Wophi {
       } else if (frame.Opcode == OpCode.Close) {
         CloseFrame closeFrame = Framing.ParseClose(frame.Data);
         await SendFrame(OpCode.Close, frame.Data);
+
+        client.Dispose(); // dispose the client (close the socket)
+        if (server.GetClients().Contains(this))
+          server.GetClients().Remove(this);
+
         OnClose(closeFrame.Code, closeFrame.Reason);
 
       // handle text and binary data
@@ -110,7 +152,7 @@ namespace Wophi {
     }
 
     // start reading frames from the client
-    public async Task StartAsync() {
+    internal async Task StartAsync() {
 
       // prepare data for reading from client
       Frame frame;
@@ -169,6 +211,10 @@ namespace Wophi {
     private ServerSslOptions sslOptions;
     private List<WebsockServerClient> clients;
     private CancellationTokenSource tokenSource;
+
+    // triggerable events
+    public event ConnectCallback OnConnect;
+    public delegate void ConnectCallback(WebsockServerClient client);
 
     // Special Websocket Server GUID for prepending client keys
     private static readonly string WebsockGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -263,6 +309,7 @@ namespace Wophi {
       // then, create client and add to stream
       WebsockServerClient serverClient = new WebsockServerClient(this, ref stream, ref client);
       clients.Add(serverClient);
+      OnConnect(serverClient);
       await serverClient.StartAsync();
     }
 
