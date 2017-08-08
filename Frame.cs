@@ -1,9 +1,12 @@
 using System;
+using System.IO;
 using System.Text;
+using System.Threading.Tasks;
+using System.Collections.Generic;
 
 namespace Wophi {
 
-  public enum OpCode {
+  public enum WebsockOpCode {
     Continue = 0x00,
     Text     = 0x01,
     Binary   = 0x02,
@@ -12,161 +15,83 @@ namespace Wophi {
     Pong     = 0x0a
   }
 
-  public struct CloseFrame {
-    public int Code;
-    public string Reason;
-  }
-
-  public struct Frame {
+  public struct WebsockFrame {
     public bool Fin;
-    public bool Masked;
-    public byte[] Data;
-    public OpCode Opcode;
-    public byte[] MaskingKey;
-
     public bool Rsv1;
     public bool Rsv2;
     public bool Rsv3;
-    public bool Complete;
-  }
-
-  public static class Framing {
+    public bool Masked;
+    public byte[] Data;
+    public byte[] MaskingKey;
+    public WebsockOpCode Opcode;
 
     // random device for generating random bytes
-    private static readonly Random rand = new Random();
+    public static readonly Random Rand = new Random();
 
     // calculate the byte size of a frame for allocation
-    private static UInt64 GetFrameSize(ref Frame frame) {
+    private static UInt64 GetFrameSize(ref WebsockFrame frame) {
       UInt64 size = (UInt64)(2 + (frame.Masked ? 4 : 0) + frame.Data.Length);
       if (frame.Data.Length >= 126 && frame.Data.Length < 63336) size += 2;
       else if (frame.Data.Length >= 65536) size += 8;
       return size;
     }
 
-    public static CloseFrame ParseClose(byte[] data) {
-      CloseFrame frame = new CloseFrame();
-      
-      // parse code
-      frame.Code  = (data[0] & 0xff) << 8;
-      frame.Code |= (data[1] & 0xff) << 0;
-
-      // parse reason
-      byte[] reason = new byte[data.Length - 2];
-      for (int i = 2; i < data.Length; i++)
-        reason[i - 2] = data[i];
-      frame.Reason = Encoding.UTF8.GetString(reason);
-
-      // return pased close frame
-      return frame;
-    }
-
-    // Dump Websocket frame into byte array data
-    public static byte[] Dump(ref Frame frame) {
-      UInt64 offset = 0;                                 // output data tracking 
-      byte[] output = new byte[GetFrameSize(ref frame)]; // output data
+     // Dump Websocket frame into byte array data
+    public byte[] Dump() {
+      UInt64 offset = 0;                                // output data tracking 
+      byte[] output = new byte[GetFrameSize(ref this)]; // output data
 
       // write first byte in header
-      output[offset] = (byte)(frame.Fin ? 0x80 : 0);   // set fin bit (1st)
-      output[offset] |= (byte)(frame.Rsv1 ? 0x40 : 0); // set rsv1 bit (2nd)
-      output[offset] |= (byte)(frame.Rsv2 ? 0x20 : 0); // set rsv2 bit (3rd)
-      output[offset] |= (byte)(frame.Rsv3 ? 0x10 : 0); // set rsv3 bit (4th)
-      output[offset] |= (byte)(frame.Opcode);          // set opcode bits (5th - 8th)
-      offset++;                                        // move to next byte
+      output[offset] = (byte)(Fin ? 0x80 : 0);   // set fin bit (1st)
+      output[offset] |= (byte)(Rsv1 ? 0x40 : 0); // set rsv1 bit (2nd)
+      output[offset] |= (byte)(Rsv2 ? 0x20 : 0); // set rsv2 bit (3rd)
+      output[offset] |= (byte)(Rsv3 ? 0x10 : 0); // set rsv3 bit (4th)
+      output[offset] |= (byte)(Opcode);          // set opcode bits (5th - 8th)
+      offset++;                                  // move to next byte
 
       // get frame masked bit value
-      byte masked = (byte)(frame.Masked ? 0x80 : 0);
+      byte masked = (byte)(Masked ? 0x80 : 0);
 
       // payload is 7 bits, write length as is
-      if (frame.Data.Length <= 125) {
-        output[offset++] = (byte)(masked | frame.Data.Length);
+      if (Data.Length <= 125) {
+        output[offset++] = (byte)(masked | Data.Length);
 
       // payload is 16 bits, distribute bytes
-      } else if (frame.Data.Length >= 126 && frame.Data.Length < 65536) {
+      } else if (Data.Length >= 126 && Data.Length < 65536) {
         output[offset++] = (byte)(masked | 126);
-        output[offset++] = (byte)((frame.Data.Length >> 8) & 0xff);
-        output[offset++] = (byte)((frame.Data.Length >> 0) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 8) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 0) & 0xff);
 
       // payload is 64 bits, distribute bytes
       } else {
         output[offset++] = (byte)(masked | 127);
-        output[offset++] = (byte)((frame.Data.Length >> 56) & 0xff);
-        output[offset++] = (byte)((frame.Data.Length >> 48) & 0xff);
-        output[offset++] = (byte)((frame.Data.Length >> 40) & 0xff);
-        output[offset++] = (byte)((frame.Data.Length >> 32) & 0xff);
-        output[offset++] = (byte)((frame.Data.Length >> 24) & 0xff);
-        output[offset++] = (byte)((frame.Data.Length >> 16) & 0xff);
-        output[offset++] = (byte)((frame.Data.Length >> 8) & 0xff);
-        output[offset++] = (byte)((frame.Data.Length >> 0) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 56) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 48) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 40) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 32) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 24) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 16) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 8) & 0xff);
+        output[offset++] = (byte)((Data.Length >> 0) & 0xff);
       }
 
       // generate mask if frame is masked
-      byte[] mask = null;
-      if (frame.Masked) {
-        mask = new byte[4];
-        rand.NextBytes(mask);
-        for (int i = 0; i < mask.Length; i++)
-          output[offset++] = mask[i];
+      MaskingKey = null;
+      if (Masked) {
+        MaskingKey = new byte[4];
+        Rand.NextBytes(MaskingKey);
+        for (int i = 0; i < MaskingKey.Length; i++)
+          output[offset++] = MaskingKey[i];
       }
 
       // add payload data
-      for (int i = 0; i < frame.Data.Length; i++)
-        output[offset++] = (byte)(frame.Masked ? // check if payload is masked
-          frame.Data[i] ^ mask[i % 4]            // payload is masked
-          : frame.Data[i]);                      // payload is not masked
+      for (int i = 0; i < Data.Length; i++)
+        output[offset++] = (byte)(Masked ? // check if payload is masked
+          Data[i] ^ MaskingKey[i % 4]            // payload is masked
+          : Data[i]);                      // payload is not masked
 
       // return generated byte data
       return output;
     }
-
-    // Parse byte array into Websocket Frame
-    public static Frame Parse(byte[] data) {
-
-      int count = 0;             // iteration, and payload size
-      UInt64 offset = 0;         // iterating through data
-      Frame frame = new Frame(); // the resulting frame
-
-      try {
-        // parse first byte (fin, rsv's and opcode)
-        frame.Complete = false;
-        frame.Fin  = (data[offset] & 0x80) != 0;      // first bit
-        frame.Rsv1 = (data[offset] & 0x40) != 0;      // second bit
-        frame.Rsv1 = (data[offset] & 0x20) != 0;      // thrid bit
-        frame.Rsv1 = (data[offset] & 0x10) != 0;      // fourth bit
-        frame.Opcode = (OpCode)(data[offset] & 0x0f); // fifth to eigth bits
-        offset++;                                     // move to next byte
-
-        // parse second byte[extended] (masked, payload length)
-        frame.Masked = (data[offset] & 0x80) != 0;  // set second byte first bit
-        int size = (int)(data[offset++] & (~0x80)); // get deciding size and move to next byte
-        if (size == 127) count = 8;                 // payload size is 64 bits long
-        else if (size == 126) count = 2;            // payload size is 16 bits long
-        if (count > 0) size = 0;                    // payload size is 7  bits long
-        while (count-- > 0)                         // read size based on bit size
-          size |= (data[offset++] & 0xff) << (8 * count);
-        frame.Data = new byte[size];            // create byte array with payload size
-
-        // get masking key if frame is masked
-        byte[] mask = null;
-        if (frame.Masked) {
-          mask = new byte[4];
-          for (int i = 0; i < 4; i++)
-            mask[i] = data[offset++];
-        }
-
-        // get payload data
-        for (UInt64 i = 0; i < (UInt64)size; i++)
-          frame.Data[i] = (byte)(frame.Masked ?  // check if frame is masked
-            data[offset + i] ^ mask[i % 4]        // if masked, unmask using masking key
-            : data[offset + i]);                  // if not, use raw byte value
-        frame.Complete = true;                    // everything ok, frame complete!
-
-      // incomplete on error
-      } catch (Exception) {
-        frame.Complete = false;
-      }
-
-      // return created frame
-      return frame;
-    } 
   }
 }

@@ -8,213 +8,55 @@ using System.Net.Security;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
+
 
 namespace Wophi {
 
-  public class ServerSslOptions {
-    private X509Certificate2 certificate;
-
-    public X509Certificate2 GetCertificate() {
-      return certificate;
-    }
-    public void SetCertificate(string filename) {
-      certificate = new X509Certificate2(filename);
-    }
-  }
-
   public class WebsockServerClient {
-    private Stream stream;
-    private TcpClient client;
-    private Queue<PingCallback> pingQueue;
     private readonly WebsockServer server;
+    private readonly WebsockProtocol protocol;
 
-    // triggerable events
-    public event CloseCallback OnClose;
-    public event MessageCallback OnMessage;
-    public delegate void MessageCallback(byte[] data);
-    public delegate void CloseCallback(int code, string reason);
+    public event Func<byte[], Task> OnMessage;
+    public event Func<ushort, string, Task> OnClose;
 
-    // Stream Read buffer size
-    private static readonly UInt32 BufferSize = 8192;
-
-    // default ping function callback
-    private delegate void PingCallback(byte[] data);
-
-    // Default ping message
-    private static readonly byte[] PingMessage = Encoding.UTF8.GetBytes("ping");
-
-    public WebsockServerClient(WebsockServer server, ref Stream stream, ref TcpClient client) {
+    public WebsockServerClient(WebsockServer server, ref ConnectionStream stream) {
       this.server = server;
-      this.stream = stream;
-      this.client = client;
-      pingQueue = new Queue<PingCallback>();
+      this.protocol = new WebsockProtocol(ref stream);
     }
 
-    // send a websocket frame over the network
-    private async Task SendFrame(OpCode opcode, byte[] data) {
-      Frame frame = new Frame();
-      frame.Fin = true;
-      frame.Data = data;
-      frame.Masked = false;
-      frame.Opcode = opcode;
-      byte[] output = Framing.Dump(ref frame);
-      if (client.Connected)
-        await stream.WriteAsync(output, 0, output.Length);
+    public void Ping(string data, Func<byte[], Task> callback) {
+      PingAsync(data, callback).GetAwaiter().GetResult();
     }
 
-    // perform synchronous send
-    public void Send(byte[] message, OpCode opcode = OpCode.Text)
-    {
-      SendFrame(opcode, message).GetAwaiter().GetResult();
+    public async Task PingAsync(string data, Func<byte[], Task> callback) {
+      await protocol.PingAsync(data, callback);
     }
 
-    // perform asynchronous send
-    public async Task SendAsync(byte[] message, OpCode opcode = OpCode.Text)
-    {
-      await SendFrame(opcode, message);
-    }
+    public async Task StartAsync() {
+      // handle incoming data
+      try {
+        while (true)
+          await OnMessage(await protocol.GetMessage());
 
-    // perform synchronous close
-    public void Close(ushort code, byte[] reason)
-    {
-      CloseAsync(code, reason).GetAwaiter().GetResult();
-    }
+      // handle websock closing
+      } catch (WebsockCloseException ex) {
+        await OnClose(ex.Code, ex.Reason);
 
-    // perform asynchronous close
-    public async Task CloseAsync(ushort code, byte[] reason)
-    {
-      // TODO: implement close code checking for ranges
-
-      byte[] closeCode = BitConverter.GetBytes(code);
-      Array.Reverse(closeCode); // little to big endian
-
-      byte[] closeFrame = new byte[closeCode.Length + reason.Length];
-      closeCode.CopyTo(closeFrame, 0);
-      reason.CopyTo(closeFrame, closeCode.Length);
-
-      await SendFrame(OpCode.Close, closeFrame);
-
-      client.Dispose(); // close the socket
-      if (server.GetClients().Contains(this))
-        server.GetClients().Remove(this);
-    }
-
-    // perform synchronous ping
-    public void Ping(byte[] message = null) {
-      PingAsync(message).GetAwaiter().GetResult();
-    }
-
-    // perform asynchronous ping
-    public async Task PingAsync(byte[] message = null) {
-      TaskCompletionSource<byte[]> onReceived = new TaskCompletionSource<byte[]>();
-      pingQueue.Enqueue(data => {
-        onReceived.SetResult(data);
-      });
-      await SendFrame(OpCode.Ping, message ?? PingMessage);
-      await onReceived.Task;
-    }
-
-    // handle a websocket frame. Returns false if frame is continue, true otherwise
-    private async Task<bool> HandleFrame(Frame frame) {
-
-      // the frame is fragmented
-      if (frame.Opcode == OpCode.Continue) {
-        return false;
-
-      // return with pong
-      } else if (frame.Opcode == OpCode.Ping) {
-        await SendFrame(OpCode.Pong, frame.Data);
-
-      // handle ping request by client
-      } else if (frame.Opcode == OpCode.Pong) {
-        if (pingQueue.Count > 0)
-          pingQueue.Dequeue()(frame.Data);
-
-      // client is requesting close, echo back and close connection
-      } else if (frame.Opcode == OpCode.Close) {
-        CloseFrame closeFrame = Framing.ParseClose(frame.Data);
-        await SendFrame(OpCode.Close, frame.Data);
-
-        client.Dispose(); // dispose the client (close the socket)
+      // close client and destroy stream on exit
+      } finally {
         if (server.GetClients().Contains(this))
           server.GetClients().Remove(this);
-
-        OnClose(closeFrame.Code, closeFrame.Reason);
-
-      // handle text and binary data
-      } else {
-        OnMessage(frame.Data);
-      }
-
-      // packet was successfull handling
-      return true;
-    }
-
-    // start reading frames from the client
-    internal async Task StartAsync() {
-
-      // prepare data for reading from client
-      Frame frame;
-      int frameRead;
-      byte[] frameData = null;
-      using (MemoryStream frameBuilder = new MemoryStream()) {
-      using (MemoryStream dataBuilder = new MemoryStream()) {
-
-        // read data from client
-        try {
-          while (client.Connected) {
-            frameData = new byte[BufferSize];
-            frameRead = await stream.ReadAsync(frameData, 0, frameData.Length);
-            Array.Resize(ref frameData, frameRead);
-
-            // parse byte data into websocket frame
-            if (frameBuilder.Length > 0) {
-              frameBuilder.Write(frameData, 0, frameData.Length);
-              frame = Framing.Parse(frameBuilder.ToArray());
-            } else frame = Framing.Parse(frameData);
-
-            // prepend data from last frame if it was fragmented
-            if (dataBuilder.Length > 0) {
-              using (MemoryStream combined = new MemoryStream()) {
-                combined.Write(dataBuilder.ToArray(), 0, (int)dataBuilder.Length);
-                combined.Write(frame.Data, 0, frame.Data.Length);
-                frame.Data = combined.ToArray();
-                dataBuilder.SetLength(0);
-              }
-            }
-
-            // if a complete frame was parsed, handle it
-            if (frame.Complete) {
-              frameBuilder.SetLength(0);
-              if (!(await HandleFrame(frame)))
-                dataBuilder.Write(frame.Data, 0, frame.Data.Length);
-            } else {
-              frameBuilder.Write(frameData, 0, frameData.Length);
-            }
-          }
-
-        // remove client from server listing
-        } catch (Exception) {
-          if (server.GetClients().Contains(this))
-            server.GetClients().Remove(this);
-        }
-      }
+        protocol.Dispose();
       }
     }
   }
 
   public class WebsockServer : IDisposable {
-    private bool isSsl = false;
-    private bool running = false;
+    private bool isSsl;
+    private bool running;
     private readonly TcpListener server;
-    private ServerSslOptions sslOptions;
     private List<WebsockServerClient> clients;
     private CancellationTokenSource tokenSource;
-
-    // triggerable events
-    public event ConnectCallback OnConnect;
-    public delegate void ConnectCallback(WebsockServerClient client);
 
     // Special Websocket Server GUID for prepending client keys
     private static readonly string WebsockGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -234,35 +76,34 @@ namespace Wophi {
       "Content-Length: {ContentLength}\r\n" +
       "\r\n{Content}";
 
-    // create server object an client container
-    public WebsockServer(IPAddress address, int port) {
+    // constructor
+    public WebsockServer(IPAddress address, int port, bool ssl) {
+      isSsl = ssl;
       server = new TcpListener(address, port);
       clients = new List<WebsockServerClient>();
       server.Server.SetSocketOption(
         SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, 1);
     }
 
-    // set server options (before start)
-    public void SetSslOptions(ServerSslOptions options) {
-      isSsl = true;
-      sslOptions = options;
+    // disposable stop
+    public void Dispose() {
+      Stop();
+    }
+
+    // start server and block (synchronously)
+    public void Start() {
+      StartAsync().GetAwaiter().GetResult();
+    }
+
+    // stop running server if running
+    public void Stop() {
+      if (tokenSource != null)
+        tokenSource.Cancel();
     }
 
     // get list of clients connected to server
     public List<WebsockServerClient> GetClients() {
       return clients;
-    }
-
-    // Deny client with http error message
-    private async Task<bool> RejectClient(TcpClient client, Stream stream, string errorMessage) {
-      byte[] errorData = Encoding.UTF8.GetBytes(HttpErrorTemplate
-        .Replace("{Content}", errorMessage)
-        .Replace("{ContentType}", "text/plain")
-        .Replace("{ContentLength}", errorMessage.Length.ToString()));
-      await stream.WriteAsync(errorData, 0, errorData.Length);
-      stream.Dispose();
-      client.Dispose();
-      return false;
     }
 
     // Create Sec-WebSocket-Accept key from Sec-Web
@@ -272,50 +113,51 @@ namespace Wophi {
       return System.Convert.ToBase64String(hash);
     }
 
+    // handle incoming clients
+    private async Task HandleClient(ConnectionStream stream) {
+      if (!(await HandshakeClient(stream))) return;
+      WebsockServerClient serverClient = new WebsockServerClient(this, ref stream);
+      clients.Add(serverClient);
+      await serverClient.StartAsync();
+    }
+
+    // Deny client with http error message
+    private async Task<bool> RejectClient(ConnectionStream stream, string errorMessage) {
+      byte[] errorData = Encoding.UTF8.GetBytes(HttpErrorTemplate
+        .Replace("{Content}", errorMessage)
+        .Replace("{ContentType}", "text/plain")
+        .Replace("{ContentLength}", errorMessage.Length.ToString()));
+      await stream.WriteAsync(errorData, errorData.Length);
+      stream.Dispose();
+      return false;
+    }
+
     // Perform websocket handshake with client 
-    private async Task<bool> HandshakeClient(TcpClient client, Stream stream) {
+    private async Task<bool> HandshakeClient(ConnectionStream stream) {
 
       // read and parse http request data
-      byte[] httpData = new byte[4096];
-      await stream.ReadAsync(httpData, 0, httpData.Length);
+      byte[] httpData = await stream.ReadAsync();
       HttpPacket packet = new HttpPacket(httpData);
 
       // client requests checks
       if (!packet.Method.ToLower().StartsWith("get"))
-        return await RejectClient(client, stream, "Only allows GET Requests");
+        return await RejectClient(stream, "Only allows GET Requests");
       if (!packet.Headers.ContainsKey("Sec-WebSocket-Key"))
-        return await RejectClient(client, stream, "No WebSocket-Key found");
+        return await RejectClient(stream, "No WebSocket-Key found");
       if (!packet.Headers.ContainsKey("Upgrade"))
-        return await RejectClient(client, stream, "Upgrade header not set");
+        return await RejectClient(stream, "Upgrade header not set");
       else if (!packet.Headers["Upgrade"].ToLower().StartsWith("websocket"))
-        return await RejectClient(client, stream, "Upgrade header not websocket");
+        return await RejectClient(stream, "Upgrade header not websocket");
       if (!packet.Headers.ContainsKey("Connection"))
-        return await RejectClient(client, stream, "Connection header not set");
+        return await RejectClient(stream, "Connection header not set");
       else if (!packet.Headers["Connection"].ToLower().StartsWith("upgrade"))
-        return await RejectClient(client, stream, "Connection header not upgrade");
+        return await RejectClient(stream, "Connection header not upgrade");
       
       // generate websocket key, send response to client and complete handshake
       httpData = Encoding.UTF8.GetBytes(HttpHandshakeSucces.Replace(
         "{WebsockKey}", GenerateKey(packet.Headers["Sec-WebSocket-Key"])));
-      await stream.WriteAsync(httpData, 0, httpData.Length);
+      await stream.WriteAsync(httpData, httpData.Length);
       return true;
-    }
-
-    // handle a new client connection
-    private async Task HandleClient(TcpClient client, Stream stream) {
-      // first, handshake with the client
-      if (!(await HandshakeClient(client, stream))) return;
-
-      // then, create client and add to stream
-      WebsockServerClient serverClient = new WebsockServerClient(this, ref stream, ref client);
-      clients.Add(serverClient);
-      OnConnect(serverClient);
-      await serverClient.StartAsync();
-    }
-
-    // start server and block (synchronously)
-    public void Start() {
-      StartAsync().GetAwaiter().GetResult();
     }
 
     // start server asynchronously
@@ -338,13 +180,7 @@ namespace Wophi {
             client.NoDelay = true;
 
             // get stream from client even if server is SSL
-            if (isSsl) {
-              SslStream stream = new SslStream(client.GetStream());
-              await stream.AuthenticateAsServerAsync(sslOptions.GetCertificate());
-              await HandleClient(client, stream);
-            } else {
-              await HandleClient(client, client.GetStream());
-            }
+            await HandleClient(new ConnectionStream(ref client, isSsl));
           }, token);
         }
 
@@ -354,17 +190,5 @@ namespace Wophi {
         running = false;
       }
     }
-
-    // stop running server if running
-    public void Stop() {
-      if (tokenSource != null)
-        tokenSource.Cancel();
-    }
-
-    // disposable stop
-    public void Dispose() {
-      Stop();
-    }
   }
-
 }
